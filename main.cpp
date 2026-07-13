@@ -1,5 +1,6 @@
 #include <iostream>
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <vector>
 #include <thread>
@@ -19,7 +20,6 @@ void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports
     for (port = start_port; port <= end_port; port++) {
         SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (server_socket == INVALID_SOCKET) {
-            cout << "Socket creation failed! Error code: " << WSAGetLastError() << endl;
             continue;
         } else {
             unsigned long ul = 1;
@@ -73,6 +73,7 @@ void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports
         }
     }
 }
+
 uint16_t CalculateChecksum(uint16_t* addr, int count) {
     uint32_t sum = 0;
 
@@ -100,6 +101,7 @@ int main() {
     } else {
         cout << "WSAStartup success" << endl;
     }
+
     CustomIPHeader ip_header;
     CustomTCPHeader tcp_header;
     ip_header.version = 4;
@@ -107,16 +109,17 @@ int main() {
     ip_header.tos = 0;
     ip_header.total_len = htons(40);
     ip_header.id = htons(12345);
-    ip_header.flags_offset = htons(0);
+    ip_header.flags_offset = 0;
     ip_header.ttl = 64;
     ip_header.protocol = 6;
     ip_header.checksum = 0;
-    ip_header.src_ip = htonl(0x7F000001);
-    ip_header.dest_ip = htonl(0x7F000001);
+    ip_header.src_ip = inet_addr("127.0.0.1");
+    ip_header.dest_ip = inet_addr("127.0.0.1");
+
     tcp_header.src_port = htons(12345);
     tcp_header.dest_port = htons(80);
     tcp_header.seq = htonl(1000);
-    tcp_header.ack_seq = htonl(0);
+    tcp_header.ack_seq = 0;
     tcp_header.reserved = 0;
     tcp_header.doff = 5;
     tcp_header.fin = 0;
@@ -129,12 +132,50 @@ int main() {
     tcp_header.cwr = 0;
     tcp_header.window = htons(1024);
     tcp_header.checksum = 0;
-    tcp_header.urg_ptr = htons(0);
+    tcp_header.urg_ptr = 0;
+
     char packet_buf[40];
     memset(packet_buf, 0, sizeof(packet_buf));
     memcpy(packet_buf, &ip_header, sizeof(CustomIPHeader));
     memcpy(packet_buf + sizeof(CustomIPHeader), &tcp_header, sizeof(CustomTCPHeader));
     cout << "====================================\n" << endl;
+
+    PseudoHeader pseudo_hdr;
+    pseudo_hdr.src_ip = ip_header.src_ip;
+    pseudo_hdr.dest_ip = ip_header.dest_ip;
+    pseudo_hdr.reserved = 0;
+    pseudo_hdr.protocol = ip_header.protocol;
+    pseudo_hdr.tcp_len = htons(sizeof(CustomTCPHeader));
+
+    char tcp_check_buf[32];
+    memset(tcp_check_buf, 0, sizeof(tcp_check_buf));
+    memcpy(tcp_check_buf, &pseudo_hdr, sizeof(pseudo_hdr));
+    memcpy(tcp_check_buf + sizeof(pseudo_hdr), &tcp_header, sizeof(tcp_header));
+
+    uint16_t tcp_checksum = CalculateChecksum(reinterpret_cast<uint16_t*>(tcp_check_buf), 32);
+    uint16_t ip_checksum = CalculateChecksum(reinterpret_cast<uint16_t*>(packet_buf), 20);
+    *(reinterpret_cast<uint16_t*>(packet_buf + 20 + 16)) = htons(tcp_checksum);
+    *(reinterpret_cast<uint16_t*>(packet_buf + 10)) = htons(ip_checksum);
+
+    SOCKET raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+    if (raw_socket == INVALID_SOCKET) {
+        cout << "Raw Socket creation failed! Error: " << WSAGetLastError() << endl;
+    } else {
+        int one = 1;
+        setsockopt(raw_socket, IPPROTO_IP, IP_HDRINCL, (char*)&one, sizeof(one));
+        sockaddr_in dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(80);
+        dest_addr.sin_addr.s_addr = ip_header.dest_ip;
+
+        int bytes_sent = sendto(raw_socket, packet_buf, 40, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+        if (bytes_sent == SOCKET_ERROR) {
+            cout << "Send failed! Error: " << WSAGetLastError() << endl;
+        }
+        closesocket(raw_socket);
+    }
+
     vector<thread> threads;
     int thread_count = 10;
     vector<int> open_ports;
@@ -144,6 +185,7 @@ int main() {
     int ports_per_thread = total_ports / thread_count;
     int remainder = total_ports % thread_count;
     int start = min;
+
     for (int i = 0; i < thread_count; ++i) {
         int ports = ports_per_thread + (i < remainder ? 1 : 0);
         int end = start + ports - 1;
@@ -151,13 +193,13 @@ int main() {
         threads.push_back(thread(ScanWorker, "127.0.0.1", start, end, ref(open_ports)));
         start = end + 1;
     }
+
     for (auto& th : threads) {
         if (th.joinable()) {
             th.join();
         }
     }
-    uint16_t ip_checksum = CalculateChecksum(reinterpret_cast<uint16_t*>(packet_buf), 20);
-    cout << "Calculated IP Checksum: 0x" << hex << uppercase << ip_checksum << endl;
+
     WSACleanup();
     return 0;
 }

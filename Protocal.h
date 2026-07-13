@@ -37,4 +37,11 @@ struct CustomTCPHeader {
     uint16_t urg_ptr;
 };
 
+struct PseudoHeader {
+    uint32_t src_ip;
+    uint32_t dest_ip;
+    uint8_t  reserved;
+    uint8_t  protocol;
+    uint16_t tcp_len;
+};
 #pragma pack(pop)

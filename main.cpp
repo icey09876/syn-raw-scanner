@@ -1,6 +1,7 @@
 #include <iostream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <windows.h>
 #include <vector>
 #include <thread>
@@ -9,15 +10,14 @@
 #include <cstring>
 #include "Protocal.h"
 
-#pragma comment(lib,"ws2_32.lib")
+#pragma comment(lib, "ws2_32.lib")
 using namespace std;
 
 mutex vec_mtx;
 mutex cout_mtx;
 
 void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports) {
-    int port;
-    for (port = start_port; port <= end_port; port++) {
+    for (int port = start_port; port <= end_port; port++) {
         SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (server_socket == INVALID_SOCKET) {
             continue;
@@ -28,7 +28,7 @@ void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports
 
             server_addr.sin_family = AF_INET;
             server_addr.sin_port = htons(port);
-            server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            server_addr.sin_addr.s_addr = inet_addr(ip.c_str());
 
             int res = connect(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr));
             if (res == 0) {
@@ -91,6 +91,21 @@ uint16_t CalculateChecksum(uint16_t* addr, int count) {
     return static_cast<uint16_t>(~sum);
 }
 
+void SnifferWorker(SOCKET sniffer_socket, vector<int>& open_ports) {
+    char recv_buf[65535];
+    while (true) {
+        sockaddr_in from_addr;
+        int from_addr_len = sizeof(from_addr);
+        int packet_size = recvfrom(sniffer_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
+        if (packet_size > 0) {
+            {
+                lock_guard<mutex> lock(cout_mtx);
+                cout << "[Sniffer] Successfully intercepted a " << packet_size << " bytes raw packet!" << endl;
+            }
+        }
+    }
+}
+
 int main() {
     SetConsoleOutputCP(65001);
     WSADATA wsaData;
@@ -101,6 +116,8 @@ int main() {
     } else {
         cout << "WSAStartup success" << endl;
     }
+
+    vector<int> open_ports;
 
     CustomIPHeader ip_header;
     CustomTCPHeader tcp_header;
@@ -157,6 +174,23 @@ int main() {
     *(reinterpret_cast<uint16_t*>(packet_buf + 20 + 16)) = htons(tcp_checksum);
     *(reinterpret_cast<uint16_t*>(packet_buf + 10)) = htons(ip_checksum);
 
+    SOCKET sniffer_socket = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+    if (sniffer_socket != INVALID_SOCKET) {
+        sockaddr_in local_addr;
+        memset(&local_addr, 0, sizeof(local_addr));
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_port = 0;
+        local_addr.sin_addr.s_addr = ip_header.src_ip;
+        bind(sniffer_socket, (struct sockaddr*)&local_addr, sizeof(local_addr));
+
+        unsigned long flag = 1;
+        DWORD dwBytesRet = 0;
+        WSAIoctl(sniffer_socket, SIO_RCVALL, &flag, sizeof(flag), NULL, 0, &dwBytesRet, NULL, NULL);
+
+        thread sniffer_thread(SnifferWorker, sniffer_socket, ref(open_ports));
+        sniffer_thread.detach();
+    }
+
     SOCKET raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
     if (raw_socket == INVALID_SOCKET) {
         cout << "Raw Socket creation failed! Error: " << WSAGetLastError() << endl;
@@ -178,7 +212,6 @@ int main() {
 
     vector<thread> threads;
     int thread_count = 10;
-    vector<int> open_ports;
     int min = 500;
     int max = 10000;
     int total_ports = max - min + 1;
@@ -198,6 +231,10 @@ int main() {
         if (th.joinable()) {
             th.join();
         }
+    }
+
+    if (sniffer_socket != INVALID_SOCKET) {
+        closesocket(sniffer_socket);
     }
 
     WSACleanup();

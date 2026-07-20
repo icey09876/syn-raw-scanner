@@ -34,7 +34,7 @@ uint16_t CalculateChecksum(uint16_t* addr, int count) {
     return static_cast<uint16_t>(~sum);
 }
 
-void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports) {
+/*void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports) {
     for (int port = start_port; port <= end_port; port++) {
         int server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (server_socket == -1) {
@@ -93,7 +93,7 @@ void ScanWorker(string ip, int start_port, int end_port, vector<int>& open_ports
         }
         close(server_socket);
     }
-}
+}*/
 
 void SnifferWorker(int sniffer_socket, vector<int>& open_ports) {
     char recv_buf[65535];
@@ -149,7 +149,8 @@ void SnifferWorker(int sniffer_socket, vector<int>& open_ports) {
 }
 
 int main() {
-    string target_ip = "127.0.0.1";
+    string source_ip ="172.25.176.246";
+    string target_ip = "192.168.31.142";
     vector<int> open_ports;
 
     CustomIPHeader ip_header;
@@ -166,8 +167,8 @@ int main() {
     ip_header.ttl = 64;
     ip_header.protocol = IPPROTO_TCP; // 6
     ip_header.checksum = 0;
-    ip_header.src_ip = inet_addr("127.0.0.1");
-    ip_header.dest_ip = inet_addr("127.0.0.1");
+    ip_header.src_ip = inet_addr(source_ip.c_str());
+    ip_header.dest_ip = inet_addr(target_ip.c_str());
 
     tcp_header.src_port = htons(12345);
     tcp_header.dest_port = htons(80);
@@ -197,7 +198,7 @@ int main() {
     pseudo_hdr.dest_ip = ip_header.dest_ip;
     pseudo_hdr.reserved = 0;
     pseudo_hdr.protocol = ip_header.protocol;
-    pseudo_hdr.tcp_len = sizeof(CustomTCPHeader);
+    pseudo_hdr.tcp_len = htons(sizeof(CustomTCPHeader));
 
     const int tcp_check_size = sizeof(PseudoHeader) + sizeof(CustomTCPHeader);
     vector<char> tcp_check_buf(tcp_check_size, 0);
@@ -209,7 +210,7 @@ int main() {
     *(reinterpret_cast<uint16_t*>(packet_buf + sizeof(CustomIPHeader) + 16)) = tcp_checksum;
     *(reinterpret_cast<uint16_t*>(packet_buf + 10)) = ip_checksum;
 
-    int sniffer_socket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    /*int sniffer_socket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     thread sniffer_thread;
     if (sniffer_socket != -1) {
         sockaddr_in local_addr;
@@ -220,24 +221,73 @@ int main() {
         bind(sniffer_socket, (struct sockaddr*)&local_addr, sizeof(local_addr));
 
         sniffer_thread = thread(SnifferWorker, sniffer_socket, ref(open_ports));
-    }
+    }*/
 
     int raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (raw_socket == -1) {
         cout << "Raw Socket creation failed! Error: " << errno << endl;
     } else {
         int one = 1;
-        setsockopt(raw_socket, IPPROTO_TCP, IP_HDRINCL, (char*)&one, sizeof(one));
+        if (setsockopt(raw_socket, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+            cout << "setsockopt IP_HDRINCL failed, errno: " << errno << endl;
+        }
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        setsockopt(raw_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
         sockaddr_in dest_addr;
         memset(&dest_addr, 0, sizeof(dest_addr));
         dest_addr.sin_family = AF_INET;
         dest_addr.sin_port = htons(80);
         dest_addr.sin_addr.s_addr = ip_header.dest_ip;
-        sendto(raw_socket, packet_buf, 40, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-        close(raw_socket);
-    }
+        int sent = sendto(raw_socket, packet_buf, 40, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+        if (sent < 0) {
+            cout << "sendto failed, errno: " << errno << " (" << strerror(errno) << ")" << endl;
+        } else {
+            cout << "sent " << sent << " bytes" << endl;
+        }
+        char recv_buf[65535];
+        sockaddr_in from_addr;
+        socklen_t from_addr_len = sizeof(from_addr);
+        while (true){
+        int packet_size = recvfrom(raw_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
+        if (packet_size > 0) {
+            CustomIPHeader* ip = reinterpret_cast<CustomIPHeader*>(recv_buf);
 
-    vector<thread> threads;
+            if (ip->version == 4) {
+                int ip_header_len = ip->ihl * 4;
+                CustomTCPHeader* recv_tcp= reinterpret_cast<CustomTCPHeader*>(recv_buf + ip_header_len);
+
+                int src_port = ntohs(recv_tcp->src_port);
+                int dest_port = ntohs(recv_tcp->dest_port);
+
+                    if (src_port == 80 && dest_port == 12345) {
+                        if (ntohl(recv_tcp->ack_seq)==1001) {
+                            if (recv_tcp->syn == 1 && recv_tcp->ack == 1) {
+                                cout << "[+] Port 80 is open (SYN-ACK received)!" << endl;
+                                open_ports.push_back(80);
+                                break;
+                            } else if (recv_tcp->rst == 1) {
+                                cout << "[-] Port 80 is closed (RST received)." << endl;
+                                break;
+                            }
+                        }
+                    }
+                }
+        }else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                cout << "[?] Port 80 Timeout (Filtered/Closed)." << endl;
+            } else {
+                cout << "Recv error, errno: " << errno << endl;
+            }
+            break;
+        }
+
+
+    }
+    }
+    /*vector<thread> threads;
     int thread_count = 10;
     int min = 500;
     int max = 10000;
@@ -269,7 +319,7 @@ int main() {
 
     if (sniffer_thread.joinable()) {
         sniffer_thread.join();
-    }
+    }*/
 
     cout << "\n--- Final Open Ports List ---" << endl;
     {

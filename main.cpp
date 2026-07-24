@@ -112,32 +112,6 @@ int ParseResponsePacket(char* recv_buf, int packet_size, uint16_t my_port, uint3
     return -1;
 }
 
-void SnifferWorker(int sniffer_socket, vector<int>& open_ports) {
-    char recv_buf[65535];
-
-    struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    if (setsockopt(sniffer_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        lock_guard<mutex> lock(cout_mtx);
-        cout << "Failed to set recv timeout, errno: " << errno << endl;
-        return;
-    }
-
-    while (keep_running) {
-        sockaddr_in from_addr;
-        socklen_t from_addr_len = sizeof(from_addr);
-
-        int packet_size = recvfrom(sniffer_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
-        if (packet_size < 0) {
-            if (errno == EBADF || !keep_running) {
-                break;
-            }
-            continue;
-        }
-    }
-}
 void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port, int start_port, int end_port, uint32_t seq) {
     for (int port = start_port; port <= end_port; port++) {
         char packet_buf[40];
@@ -150,31 +124,40 @@ void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port,
         int sent = sendto(raw_socket, packet_buf, 40, 0, (struct sockaddr *) &dest_addr, sizeof(dest_addr));
         if (sent < 0) {
             cout << "sendto failed, errno: " << errno << " (" << strerror(errno) << ")" << endl;
-        } else {
-            cout << "sent " << sent << " bytes" << endl;
         }
-        usleep(5000);
+        usleep(10000);
     }
-
 }
-void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* open_ports) {
+    void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* open_ports) {
     char recv_buf[65535];
-    sockaddr_in from_addr;
-    socklen_t from_addr_len = sizeof(from_addr);
+
 
     while (keep_running) {
-        int packet_size = recvfrom(raw_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
-        if (packet_size > 0) {
-            int open_port = ParseResponsePacket(recv_buf, packet_size, my_port, seq + 1);
+        sockaddr_in from_addr;
+        socklen_t from_addr_len = sizeof(from_addr);
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(raw_socket, &readfds);
+        struct timeval timeout={1,0};
 
-            if (open_port > 0) {
-                {
-                    lock_guard<mutex> lock(vec_mtx);
-                    open_ports->push_back(open_port);
-                }
-                {
-                    lock_guard<mutex> lock(cout_mtx);
-                    cout << "[+] Port " << open_port << " is OPEN!" << endl;
+
+        int ret = select(raw_socket + 1, &readfds, NULL, NULL, &timeout);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }else if(ret == 0) {
+            continue;
+        }
+        if (FD_ISSET(raw_socket, &readfds)) {
+            int packet_size = recvfrom(raw_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
+            if (packet_size > 0) {
+                int open_port = ParseResponsePacket(recv_buf, packet_size, my_port, seq + 1);
+
+                if (open_port > 0) {
+                    {
+                        lock_guard<mutex> lock(vec_mtx);
+                        open_ports->push_back(open_port);
+                    }
                 }
             }
         }
@@ -201,10 +184,6 @@ int main() {
             cout << "setsockopt IP_HDRINCL failed, errno: " << errno << endl;
             close(raw_socket);
         }
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        setsockopt(raw_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     }
     thread recv_th(RecvWorker, raw_socket, my_port, seq, &open_ports);

@@ -11,11 +11,20 @@
 #include <unistd.h>
 #include <errno.h>
 #include "Protocal.h"
+#include <queue>
+#include <condition_variable>
+
 using namespace std;
 
 mutex vec_mtx;
 mutex cout_mtx;
 atomic<bool> keep_running(true);
+
+queue<int> port_queue;
+mutex queue_mtx;
+condition_variable cv;
+bool all_ports_added = false;
+
 
 uint16_t CalculateChecksum(uint16_t* addr, int count) {
     uint32_t sum = 0;
@@ -45,7 +54,7 @@ void BuildSynPacket(char* packet_buf,const string& src_ip,const string& dest_ip,
     ip_header.id = htons(12345);
     ip_header.flags_offset = 0;
     ip_header.ttl = 64;
-    ip_header.protocol = IPPROTO_TCP; // 6
+    ip_header.protocol = IPPROTO_TCP;
     ip_header.checksum = 0;
     ip_header.src_ip = inet_addr(src_ip.c_str());
     ip_header.dest_ip = inet_addr(dest_ip.c_str());
@@ -87,9 +96,8 @@ void BuildSynPacket(char* packet_buf,const string& src_ip,const string& dest_ip,
     uint16_t ip_checksum = CalculateChecksum(reinterpret_cast<uint16_t*>(packet_buf), sizeof(CustomIPHeader));
     *(reinterpret_cast<uint16_t*>(packet_buf + sizeof(CustomIPHeader) + 16)) = tcp_checksum;
     *(reinterpret_cast<uint16_t*>(packet_buf + 10)) = ip_checksum;
-
-
 }
+
 int ParseResponsePacket(char* recv_buf, int packet_size, uint16_t my_port, uint32_t expct_ack) {
     if (packet_size < static_cast<int>(sizeof(CustomIPHeader))) return -1;
 
@@ -112,8 +120,23 @@ int ParseResponsePacket(char* recv_buf, int packet_size, uint16_t my_port, uint3
     return -1;
 }
 
-void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port, int start_port, int end_port, uint32_t seq) {
-    for (int port = start_port; port <= end_port; port++) {
+void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port, uint32_t seq) {
+    while (true) {
+        int port;
+        {
+            unique_lock<mutex> lock(queue_mtx);
+
+            cv.wait(lock, [] {
+                return !port_queue.empty() || all_ports_added;
+            });
+
+            if (port_queue.empty() && all_ports_added) {
+                return;
+            }
+
+            port = port_queue.front();
+            port_queue.pop();
+        }
         char packet_buf[40];
         BuildSynPacket(packet_buf, src_ip, dest_ip, my_port, port, seq);
         sockaddr_in dest_addr;
@@ -123,14 +146,15 @@ void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port,
         dest_addr.sin_addr.s_addr = inet_addr(dest_ip.c_str());
         int sent = sendto(raw_socket, packet_buf, 40, 0, (struct sockaddr *) &dest_addr, sizeof(dest_addr));
         if (sent < 0) {
+            lock_guard<mutex> lock(cout_mtx);
             cout << "sendto failed, errno: " << errno << " (" << strerror(errno) << ")" << endl;
         }
-        usleep(10000);
+        usleep(500);
     }
 }
-    void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* open_ports) {
-    char recv_buf[65535];
 
+void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* open_ports) {
+    char recv_buf[65535];
 
     while (keep_running) {
         sockaddr_in from_addr;
@@ -139,7 +163,6 @@ void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port,
         FD_ZERO(&readfds);
         FD_SET(raw_socket, &readfds);
         struct timeval timeout={1,0};
-
 
         int ret = select(raw_socket + 1, &readfds, NULL, NULL, &timeout);
         if (ret < 0) {
@@ -152,19 +175,14 @@ void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port,
             int packet_size = recvfrom(raw_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
             if (packet_size > 0) {
                 int open_port = ParseResponsePacket(recv_buf, packet_size, my_port, seq + 1);
-
                 if (open_port > 0) {
-                    {
-                        lock_guard<mutex> lock(vec_mtx);
-                        open_ports->push_back(open_port);
-                    }
+                    lock_guard<mutex> lock(vec_mtx);
+                    open_ports->push_back(open_port);
                 }
             }
         }
     }
 }
-
-
 
 int main() {
     string src_ip ="172.25.176.246";
@@ -172,7 +190,9 @@ int main() {
     uint16_t my_port = 12345;
     uint32_t seq = 1000;
     vector<int> open_ports;
-
+    int start_port = 1;
+    int end_port = 10000;
+    int num_threads = 4;
 
     int raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (raw_socket == -1) {
@@ -184,19 +204,35 @@ int main() {
             cout << "setsockopt IP_HDRINCL failed, errno: " << errno << endl;
             close(raw_socket);
         }
-
     }
+
     thread recv_th(RecvWorker, raw_socket, my_port, seq, &open_ports);
-    thread send_th(SendWorker, raw_socket, src_ip, dest_ip, my_port, 1, 100, seq);
-    send_th.join();
+
+    vector<thread> send_th;
+    for (int i = 0; i < num_threads; i++) {
+        send_th.push_back(thread(SendWorker, raw_socket, src_ip, dest_ip, my_port, seq));
+    }
+
+    {
+        lock_guard<mutex> lock(queue_mtx);
+        for (int port = start_port; port <= end_port; port++) {
+            port_queue.push(port);
+        }
+        all_ports_added = true;
+    }
+    cv.notify_all();
+
+    for (auto& th : send_th) {
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+
     this_thread::sleep_for(chrono::seconds(2));
     keep_running = false;
     recv_th.join();
     for (int p:open_ports) {
-        {
-            lock_guard<mutex> lock(cout_mtx);
-            cout <<"open port:"<< p << endl;
-        }
+        cout <<"open port:"<< p << endl;
     }
     close(raw_socket);
     return 0;

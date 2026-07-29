@@ -13,6 +13,7 @@
 #include "Protocal.h"
 #include <queue>
 #include <condition_variable>
+#include <algorithm>
 
 using namespace std;
 
@@ -149,7 +150,7 @@ void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port,
             lock_guard<mutex> lock(cout_mtx);
             cout << "sendto failed, errno: " << errno << " (" << strerror(errno) << ")" << endl;
         }
-        usleep(500);
+        //usleep(100);
     }
 }
 
@@ -184,16 +185,44 @@ void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* ope
     }
 }
 
-int main() {
+
+int main(int argc, char* argv[]) {
     string src_ip ="172.25.176.246";
     string dest_ip = "192.168.31.1";
     uint16_t my_port = 12345;
     uint32_t seq = 1000;
-    vector<int> open_ports;
+    int num_threads = 4;
     int start_port = 1;
     int end_port = 10000;
-    int num_threads = 4;
+    vector<int> open_ports;
+    int opt;
+    string str;
 
+    while ((opt = getopt(argc, argv, "s:h:p:t:")) != -1) {
+        switch (opt) {
+            case 's':
+                src_ip = optarg;
+                break;
+            case 'h':
+                dest_ip = optarg;
+                break;
+            case 'p': {
+                str = optarg;
+                size_t pos = str.find('-');
+                string start_str = str.substr(0,pos );
+                string end_str = str.substr(pos + 1);
+                start_port = stoi(start_str);
+                end_port = stoi(end_str);
+                break;
+            }
+            case 't':
+                num_threads = stoi(optarg);
+                break;
+            case '?':
+                cout << "Usage: please input -s -h -p -t" << endl;
+                return -1;
+        }
+    }
     int raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (raw_socket == -1) {
         cout << "Raw Socket creation failed! Error: " << errno << endl;
@@ -205,7 +234,7 @@ int main() {
             close(raw_socket);
         }
     }
-
+    auto start = chrono::steady_clock::now();
     thread recv_th(RecvWorker, raw_socket, my_port, seq, &open_ports);
 
     vector<thread> send_th;
@@ -227,13 +256,17 @@ int main() {
             th.join();
         }
     }
-
-    this_thread::sleep_for(chrono::seconds(2));
+    this_thread::sleep_for(chrono::milliseconds(500));
     keep_running = false;
     recv_th.join();
+    auto end = chrono::steady_clock::now();
+    sort(open_ports.begin(), open_ports.end());
+    open_ports.erase(unique(open_ports.begin(), open_ports.end()), open_ports.end());
     for (int p:open_ports) {
         cout <<"open port:"<< p << endl;
     }
     close(raw_socket);
+    auto elapsed_ms = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    cout << "elapsed: " << elapsed_ms << " ms" << endl;
     return 0;
 }

@@ -1,5 +1,5 @@
 conversion.cpp
-
+.gitattributes
 .idea/
 cmake-build-debug/
 main

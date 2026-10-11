@@ -2,7 +2,7 @@
 
 A TCP SYN ("half-open") port scanner for Linux, written in C++17. It builds every IPv4 and TCP header by hand, sends the packets through a raw socket and parses the replies itself, so no full TCP connection is ever opened.
 
-The project was built over about 38 days as a learning exercise. It started as an ordinary `connect()` scanner and grew step by step: hand-built packet headers, checksums, a separate receiver thread, `select()`-based I/O, a worker thread pool and command-line options. The commit history follows that path.
+The project was built as a learning exercise. It started as an ordinary `connect()` scanner and grew step by step: hand-built packet headers, checksums, a separate receiver thread, `select()`-based I/O, a worker thread pool and command-line options. The commit history follows that path.
 
 > **Only scan hosts you own or have explicit permission to scan.** Scanning other people's networks may be illegal where you live.
 
@@ -129,7 +129,6 @@ Capture on the interface you scan from and apply the display filter `tcp.port ==
 | `CMakeLists.txt` | Build configuration |
 | `DECISION.md` | Architecture decisions and trade-offs |
 | `DEV_LOG.md` | Log of bugs, wrong assumptions and how they were fixed |
-| `38-Day_CPP_SYN_Scanner_Development_Plan.md` | The day-by-day development plan |
 
 ## Limitations
 

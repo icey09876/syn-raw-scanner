@@ -10,7 +10,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
-#include "Protocal.h"
+#include "Protocol.h"
 #include <queue>
 #include <condition_variable>
 #include <algorithm>

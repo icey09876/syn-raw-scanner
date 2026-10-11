@@ -5,12 +5,14 @@
 #include <cstring>
 #include <atomic>
 #include <thread>
+#include <chrono>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
-#include "Protocal.h"
+#include "Protocol.h"
 #include <queue>
 #include <condition_variable>
 #include <algorithm>
@@ -34,7 +36,11 @@ uint16_t CalculateChecksum(uint16_t* addr, int count) {
         count -= 2;
     }
     if (count == 1) {
-        sum += *(reinterpret_cast<uint8_t*>(addr)) << 8;
+        // Pad the last byte with a zero byte after it, as RFC 1071 requires.
+        // Copying it into a word keeps this correct on both little- and big-endian CPUs.
+        uint16_t last_word = 0;
+        memcpy(&last_word, addr, 1);
+        sum += last_word;
     }
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -99,11 +105,11 @@ void BuildSynPacket(char* packet_buf,const string& src_ip,const string& dest_ip,
     *(reinterpret_cast<uint16_t*>(packet_buf + 10)) = ip_checksum;
 }
 
-int ParseResponsePacket(char* recv_buf, int packet_size, uint16_t my_port, uint32_t expct_ack) {
+int ParseResponsePacket(char* recv_buf, int packet_size, uint32_t target_ip, uint16_t my_port, uint32_t expct_ack) {
     if (packet_size < static_cast<int>(sizeof(CustomIPHeader))) return -1;
 
     CustomIPHeader* ip = reinterpret_cast<CustomIPHeader*>(recv_buf);
-    if (ip->version == 4) {
+    if (ip->version == 4 && ip->ihl >= 5 && ip->src_ip == target_ip) {
         int ip_header_len = ip->ihl * 4;
         if (packet_size < ip_header_len + static_cast<int>(sizeof(CustomTCPHeader))) return -1;
 
@@ -148,13 +154,12 @@ void SendWorker(int raw_socket, string src_ip, string dest_ip, uint16_t my_port,
         int sent = sendto(raw_socket, packet_buf, 40, 0, (struct sockaddr *) &dest_addr, sizeof(dest_addr));
         if (sent < 0) {
             lock_guard<mutex> lock(cout_mtx);
-            cout << "sendto failed, errno: " << errno << " (" << strerror(errno) << ")" << endl;
+            cerr << "sendto failed, errno: " << errno << " (" << strerror(errno) << ")" << endl;
         }
-        //usleep(100);
     }
 }
 
-void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* open_ports) {
+void RecvWorker(int raw_socket, uint32_t target_ip, uint16_t my_port, uint32_t seq, vector<int>* open_ports) {
     char recv_buf[65535];
 
     while (keep_running) {
@@ -175,7 +180,7 @@ void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* ope
         if (FD_ISSET(raw_socket, &readfds)) {
             int packet_size = recvfrom(raw_socket, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&from_addr, &from_addr_len);
             if (packet_size > 0) {
-                int open_port = ParseResponsePacket(recv_buf, packet_size, my_port, seq + 1);
+                int open_port = ParseResponsePacket(recv_buf, packet_size, target_ip, my_port, seq + 1);
                 if (open_port > 0) {
                     lock_guard<mutex> lock(vec_mtx);
                     open_ports->push_back(open_port);
@@ -186,9 +191,71 @@ void RecvWorker(int raw_socket, uint16_t my_port, uint32_t seq, vector<int>* ope
 }
 
 
+// Parses a whole string as an integer in [min, max]. Rejects input like "abc" or "80x".
+bool ParseNumber(const string& str, int min, int max, int& value) {
+    try {
+        size_t used = 0;
+        value = stoi(str, &used);
+        return used == str.size() && value >= min && value <= max;
+    } catch (const exception&) {
+        return false;
+    }
+}
+
+// Accepts a single port ("80") or a range ("1-1024").
+bool ParsePortRange(const string& str, int& start_port, int& end_port) {
+    size_t pos = str.find('-');
+    if (pos == string::npos) {
+        if (!ParseNumber(str, 1, 65535, start_port)) return false;
+        end_port = start_port;
+        return true;
+    }
+    return ParseNumber(str.substr(0, pos), 1, 65535, start_port) &&
+           ParseNumber(str.substr(pos + 1), 1, 65535, end_port) &&
+           start_port <= end_port;
+}
+
+bool IsValidIPv4(const string& ip) {
+    in_addr addr;
+    return inet_pton(AF_INET, ip.c_str(), &addr) == 1;
+}
+
+// Asks the kernel which local address it would use to reach dest_ip.
+// connect() on a UDP socket sends nothing; it only picks a route and a source address.
+bool DetectSourceIP(const string& dest_ip, string& src_ip) {
+    int udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_socket < 0) return false;
+
+    sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(53);
+    inet_pton(AF_INET, dest_ip.c_str(), &dest_addr.sin_addr);
+
+    sockaddr_in local_addr;
+    socklen_t local_addr_len = sizeof(local_addr);
+    bool ok = connect(udp_socket, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) == 0 &&
+              getsockname(udp_socket, (struct sockaddr*)&local_addr, &local_addr_len) == 0;
+    close(udp_socket);
+    if (!ok) return false;
+
+    char buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_addr.sin_addr, buf, sizeof(buf));
+    src_ip = buf;
+    return true;
+}
+
+void PrintUsage(const char* prog) {
+    cerr << "Usage: " << prog << " -h <target-ip> [-p <start>-<end>] [-t <threads>] [-s <source-ip>]\n"
+         << "  -h  target IPv4 address (required)\n"
+         << "  -p  port or port range, e.g. 80 or 1-1024 (default: 1-10000)\n"
+         << "  -t  number of sender threads, 1-64 (default: 4)\n"
+         << "  -s  source IPv4 address (default: detected automatically)\n";
+}
+
 int main(int argc, char* argv[]) {
-    string src_ip ="172.25.176.246";
-    string dest_ip = "192.168.31.1";
+    string src_ip;
+    string dest_ip;
     uint16_t my_port = 12345;
     uint32_t seq = 1000;
     int num_threads = 4;
@@ -196,7 +263,6 @@ int main(int argc, char* argv[]) {
     int end_port = 10000;
     vector<int> open_ports;
     int opt;
-    string str;
 
     while ((opt = getopt(argc, argv, "s:h:p:t:")) != -1) {
         switch (opt) {
@@ -206,36 +272,69 @@ int main(int argc, char* argv[]) {
             case 'h':
                 dest_ip = optarg;
                 break;
-            case 'p': {
-                str = optarg;
-                size_t pos = str.find('-');
-                string start_str = str.substr(0,pos );
-                string end_str = str.substr(pos + 1);
-                start_port = stoi(start_str);
-                end_port = stoi(end_str);
+            case 'p':
+                if (!ParsePortRange(optarg, start_port, end_port)) {
+                    cerr << "Invalid port range: " << optarg << " (use e.g. 80 or 1-1024, ports 1-65535)" << endl;
+                    return -1;
+                }
                 break;
-            }
             case 't':
-                num_threads = stoi(optarg);
+                if (!ParseNumber(optarg, 1, 64, num_threads)) {
+                    cerr << "Invalid thread count: " << optarg << " (must be 1-64)" << endl;
+                    return -1;
+                }
                 break;
-            case '?':
-                cout << "Usage: please input -s -h -p -t" << endl;
+            default:
+                PrintUsage(argv[0]);
                 return -1;
         }
     }
+
+    if (dest_ip.empty()) {
+        PrintUsage(argv[0]);
+        return -1;
+    }
+    if (!IsValidIPv4(dest_ip)) {
+        cerr << "Invalid target IP address: " << dest_ip << endl;
+        return -1;
+    }
+    if (src_ip.empty()) {
+        if (!DetectSourceIP(dest_ip, src_ip)) {
+            cerr << "Could not detect a source IP for " << dest_ip << ", please pass one with -s" << endl;
+            return -1;
+        }
+    } else if (!IsValidIPv4(src_ip)) {
+        cerr << "Invalid source IP address: " << src_ip << endl;
+        return -1;
+    }
+
     int raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (raw_socket == -1) {
-        cout << "Raw Socket creation failed! Error: " << errno << endl;
+        cerr << "Raw socket creation failed: " << strerror(errno)
+             << " (raw sockets need root or the CAP_NET_RAW capability)" << endl;
         return -1;
-    } else {
-        int one = 1;
-        if (setsockopt(raw_socket, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-            cout << "setsockopt IP_HDRINCL failed, errno: " << errno << endl;
-            close(raw_socket);
-        }
     }
+    int one = 1;
+    if (setsockopt(raw_socket, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        cerr << "setsockopt IP_HDRINCL failed: " << strerror(errno) << endl;
+        close(raw_socket);
+        return -1;
+    }
+    // Every probed port sends a reply (SYN-ACK or RST), and all of them wait in this
+    // socket's receive buffer until RecvWorker reads them. The default buffer (~200 KB)
+    // overflows when several threads send at full speed, and the kernel then silently
+    // drops replies, including SYN-ACKs from open ports. SO_RCVBUFFORCE (needs root or
+    // CAP_NET_ADMIN) can go past the system limit; plain SO_RCVBUF is capped by net.core.rmem_max.
+    int recv_buf_size = 32 * 1024 * 1024;
+    if (setsockopt(raw_socket, SOL_SOCKET, SO_RCVBUFFORCE, &recv_buf_size, sizeof(recv_buf_size)) < 0) {
+        setsockopt(raw_socket, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, sizeof(recv_buf_size));
+    }
+
+    cout << "Scanning " << dest_ip << " ports " << start_port << "-" << end_port
+         << " from " << src_ip << " with " << num_threads << " sender thread(s)" << endl;
     auto start = chrono::steady_clock::now();
-    thread recv_th(RecvWorker, raw_socket, my_port, seq, &open_ports);
+    uint32_t target_ip = inet_addr(dest_ip.c_str());
+    thread recv_th(RecvWorker, raw_socket, target_ip, my_port, seq, &open_ports);
 
     vector<thread> send_th;
     for (int i = 0; i < num_threads; i++) {

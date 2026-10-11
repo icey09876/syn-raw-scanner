@@ -2,4 +2,6 @@ conversion.cpp
 .gitattributes
 .idea/
 cmake-build-debug/
+build/
 main
+syn_scanner

@@ -60,13 +60,13 @@
 - **Day 34** — Large-scale port scan experiment. Scan several thousand ports locally to verify the scanner's speed and stability under high concurrency.
 
 ## Phase 6: Performance Optimization & Tooling (Day 35 – Day 38)
-**Core objective:** Elevate the project's academic weight and shape it into a solid piece of evidence for the university application (Personal Statement) and interviews.
+**Core objective:** Turn the working scanner into a usable, measured tool, and document what was learned.
 
 **Daily breakdown:**
 - **Day 35** — Thread pool concept. Understand the Worker and Task Queue model; cap the number of concurrent threads to avoid overwhelming the system with unrestrained thread creation.
 - **Day 36** — Command-line argument parsing. Support `main(int argc, char* argv[])`, adding dynamic flags such as `-h` (host), `-p` (port), and `-t` (threads).
 - **Day 37** — Performance testing and tuning. Measure and optimize scan speed, CPU usage, and response time; record a terminal video of scanning tens of thousands of ports within seconds.
-- **Day 38** — Project write-up and documentation. Consolidate key technical themes — protocol analysis, raw socket implementation, multithreaded synchronization, the select mechanism — into polished material for the Personal Statement and interview.
+- **Day 38** — Project write-up and documentation. Consolidate key technical themes — protocol analysis, raw socket implementation, multithreaded synchronization, the select mechanism — into a README and design notes.
 
 ---
 *End of plan*

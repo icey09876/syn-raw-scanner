@@ -22,7 +22,7 @@ This scanner currently reports **open** ports only (see [Limitations](#limitatio
 
 ## Building packets by hand
 
-`Protocal.h` defines the 20-byte IPv4 header, the 20-byte TCP header and the 12-byte TCP pseudo-header as structs. `#pragma pack(push, 1)` stops the compiler from inserting padding, so each struct matches the on-wire layout byte for byte. Bit-fields hold the 4-bit fields (IP version, IHL, TCP data offset) and the individual TCP flags.
+`Protocol.h` defines the 20-byte IPv4 header, the 20-byte TCP header and the 12-byte TCP pseudo-header as structs. `#pragma pack(push, 1)` stops the compiler from inserting padding, so each struct matches the on-wire layout byte for byte. Bit-fields hold the 4-bit fields (IP version, IHL, TCP data offset) and the individual TCP flags.
 
 `BuildSynPacket()` in `main.cpp` does the following:
 
@@ -54,16 +54,17 @@ main thread ──▶  [ 1 | 2 | 3 | ... | N ]
 
 - **Sender threads** form a fixed-size worker pool. Each one waits on a condition variable, takes the next port from the shared queue, builds a SYN packet and sends it. A worker exits once the queue is empty and the main thread has marked every port as added.
 - **The receiver thread** starts before the senders, so no early reply is missed. It waits with `select()` and a 1-second timeout instead of a blocking `recvfrom()`. That way it never blocks forever when no packets arrive, and it regularly checks the `std::atomic<bool>` stop flag.
-- **Matching replies:** a packet counts as an answer to one of the probes when it has both SYN and ACK set, its destination port is the scanner's source port (12345), and its acknowledgement number is the probe's sequence number + 1.
+- **Matching replies:** a packet counts as an answer to one of the probes when it comes from the target's IP address, has both SYN and ACK set, its destination port is the scanner's source port (12345), and its acknowledgement number is the probe's sequence number + 1.
+- **Receive buffer:** every probed port sends a reply (SYN-ACK or RST), and all of them queue in the raw socket's receive buffer until the receiver reads them. The buffer is raised from the default ~200 KB to 32 MB. With the default size, several sender threads overflowed it and the kernel silently dropped SYN-ACKs, so open ports were missed (see [DEV_LOG.md](DEV_LOG.md)).
 - **Shutdown:** after all senders finish, the main thread waits 500 ms for late replies and then stops the receiver. Finally it sorts and de-duplicates the results, because a target may retransmit its SYN-ACK.
 
-Design decisions and their trade-offs are recorded in [DECISION.md](DECISION.md). Bugs and wrong assumptions met along the way are logged in [INTERVIEW_NOTES.md](INTERVIEW_NOTES.md).
+Design decisions and their trade-offs are recorded in [DECISION.md](DECISION.md). Bugs and wrong assumptions met along the way are logged in [DEV_LOG.md](DEV_LOG.md).
 
 ## Requirements
 
 - Linux. The code uses POSIX socket headers; Windows and macOS are not supported.
 - A C++17 compiler (g++ or clang++)
-- CMake 4.1 or newer, or build with g++ directly (see below)
+- CMake 3.10 or newer, or build with g++ directly (see below)
 - Root privileges or the `CAP_NET_RAW` capability, because raw sockets are privileged
 
 ## Build
@@ -71,33 +72,29 @@ Design decisions and their trade-offs are recorded in [DECISION.md](DECISION.md)
 ```bash
 cmake -S . -B build
 cmake --build build
-# the binary is build/main
+# the binary is build/syn_scanner
 ```
 
 Without CMake:
 
 ```bash
-g++ -std=c++17 -O2 -pthread main.cpp -o main
+g++ -std=c++17 -O2 -pthread main.cpp -o syn_scanner
 ```
 
 ## Usage
 
 ```bash
-sudo ./main -s <source-ip> -h <target-ip> -p <start>-<end> -t <threads>
+sudo ./syn_scanner -h <target-ip> [-p <start>-<end>] [-t <threads>] [-s <source-ip>]
 ```
 
 | Option | Meaning | Default |
 |---|---|---|
-| `-s` | Source IP written into each packet: the address of your own network interface | `172.25.176.246` |
-| `-h` | Target IP address | `192.168.31.1` |
-| `-p` | Port range, e.g. `1-1024`. A single port such as `80` also works. | `1-10000` |
-| `-t` | Number of sender threads | `4` |
+| `-h` | Target IPv4 address | required |
+| `-p` | Port range, e.g. `1-1024`, or a single port such as `80` (ports 1–65535) | `1-10000` |
+| `-t` | Number of sender threads, 1–64 | `4` |
+| `-s` | Source IPv4 address written into each packet | detected automatically |
 
-The defaults match the author's test setup, so always pass `-s` and `-h` on another machine. To find the right source address for a target, run:
-
-```bash
-ip route get 192.168.1.1    # use the address shown after "src"
-```
+The source address is normally detected automatically: the program asks the kernel which local address it would use to reach the target. Pass `-s` only to override it. Invalid input, such as a malformed IP address, a port outside 1–65535 or a reversed range, is rejected with an error message.
 
 ### Example
 
@@ -106,13 +103,14 @@ Start two local services, then scan the loopback interface:
 ```bash
 python3 -m http.server 8000 --bind 127.0.0.1 &
 python3 -m http.server 8080 --bind 127.0.0.1 &
-sudo ./main -s 127.0.0.1 -h 127.0.0.1 -p 3000-9000 -t 1
+sudo ./syn_scanner -h 127.0.0.1 -p 3000-9000
 ```
 
 ```
+Scanning 127.0.0.1 ports 3000-9000 from 127.0.0.1 with 4 sender thread(s)
 open port:8000
 open port:8080
-elapsed: 541 ms
+elapsed: 655 ms
 ```
 
 Most of the elapsed time is the fixed 500 ms wait for late replies.
@@ -126,27 +124,27 @@ Capture on the interface you scan from and apply the display filter `tcp.port ==
 | File | Contents |
 |---|---|
 | `main.cpp` | Checksum, packet builder, reply parser, sender and receiver threads, command-line parsing |
-| `Protocal.h` | Packed IPv4, TCP and pseudo-header structs |
+| `Protocol.h` | Packed IPv4, TCP and pseudo-header structs |
 | `CMakeLists.txt` | Build configuration |
 | `DECISION.md` | Architecture decisions and trade-offs |
-| `INTERVIEW_NOTES.md` | Log of bugs, wrong assumptions and how they were fixed |
+| `DEV_LOG.md` | Log of bugs, wrong assumptions and how they were fixed |
 | `38-Day_CPP_SYN_Scanner_Development_Plan.md` | The day-by-day development plan |
 
 ## Limitations
 
 - Only **open** ports are reported. Closed ports (RST) and filtered ports (no reply) are not told apart yet.
-- There is no retransmission and no rate limiting. If a probe or its reply is dropped, either on the network or because the receiver cannot keep up, the port is missed. `-t 1` gives the most reliable results.
-- Every probe uses the same source port (12345), sequence number (1000) and IP ID, which makes the scan easy to fingerprint. Replies are not checked against the target's IP address.
-- IPv4 only, one target per run. The bit-field layout in `Protocal.h` assumes a little-endian CPU (x86 and most ARM systems).
-- Command-line input is barely validated: an invalid port range or IP address can crash the program or give wrong results.
+- There is no retransmission and no rate limiting. If a probe or its reply is lost on the network, the port is missed.
+- Without root, the receive buffer is capped by `net.core.rmem_max` (a few hundred KB by default), so replies may be dropped again with several threads. Use `-t 1` in that case.
+- Every probe uses the same source port (12345), sequence number (1000) and IP ID, which makes the scan easy to fingerprint.
+- IPv4 only, one target per run. The bit-field layout in `Protocol.h` assumes a little-endian CPU (x86 and most ARM systems).
+- The program always waits a fixed 500 ms for late replies, which may be too short on a slow network.
 
 ## Possible next steps
 
 - Classify ports as open, closed or filtered using RST replies and timeouts
 - Retransmit unanswered probes and add a configurable send rate
-- Randomise the source port and sequence number per scan, and check each reply's source IP
-- Detect the source IP automatically instead of requiring `-s`
-- Validate command-line input and print a proper usage message
+- Randomise the source port and sequence number per scan
+- Make the final wait for late replies configurable
 
 ## References
 

@@ -103,6 +103,7 @@ Start two local services, then scan the loopback interface:
 ```bash
 python3 -m http.server 8000 --bind 127.0.0.1 &
 python3 -m http.server 8080 --bind 127.0.0.1 &
+sleep 2    # give the servers time to start listening before scanning
 sudo ./syn_scanner -h 127.0.0.1 -p 3000-9000
 ```
 

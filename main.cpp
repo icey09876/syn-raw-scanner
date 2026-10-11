@@ -320,6 +320,15 @@ int main(int argc, char* argv[]) {
         close(raw_socket);
         return -1;
     }
+    // Every probed port sends a reply (SYN-ACK or RST), and all of them wait in this
+    // socket's receive buffer until RecvWorker reads them. The default buffer (~200 KB)
+    // overflows when several threads send at full speed, and the kernel then silently
+    // drops replies, including SYN-ACKs from open ports. SO_RCVBUFFORCE (needs root or
+    // CAP_NET_ADMIN) can go past the system limit; plain SO_RCVBUF is capped by net.core.rmem_max.
+    int recv_buf_size = 32 * 1024 * 1024;
+    if (setsockopt(raw_socket, SOL_SOCKET, SO_RCVBUFFORCE, &recv_buf_size, sizeof(recv_buf_size)) < 0) {
+        setsockopt(raw_socket, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, sizeof(recv_buf_size));
+    }
 
     cout << "Scanning " << dest_ip << " ports " << start_port << "-" << end_port
          << " from " << src_ip << " with " << num_threads << " sender thread(s)" << endl;

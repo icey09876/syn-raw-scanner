@@ -128,7 +128,6 @@ Capture on the interface you scan from and apply the display filter `tcp.port ==
 | `CMakeLists.txt` | Build configuration |
 | `DECISION.md` | Architecture decisions and trade-offs |
 | `DEV_LOG.md` | Log of bugs, wrong assumptions and how they were fixed |
-| `38-Day_CPP_SYN_Scanner_Development_Plan.md` | The day-by-day development plan |
 
 ## Limitations
 
